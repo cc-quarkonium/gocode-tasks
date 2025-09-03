@@ -32,8 +32,9 @@ type mockDB struct {
 	data  map[uint64]Row
 	maxID uint64
 
-	maxIDErr     bool
-	saveRowsErr  bool
+	maxIDErr     bool  // будем ли имитировать кастомную ошибку в методе GetMaxID
+	loadRowsErr  bool  // будем ли имитировать временную ошибку в методе LoadRows
+	saveRowsErr  bool  // будем ли имитировать временную ошибку в методе SaveRows
 	loadСallNums []int // вызовы LoadRows() и кол-во отданных Rows
 	saveСallNums []int // вызовы SaveRows() и кол-во сохраненных Rows
 
@@ -46,13 +47,15 @@ type mockDB struct {
 // Глобальное хранилище "подключений"
 var mockDatabases = map[string]*mockDB{}
 
-func NewMockDatabase(dbname string, ids []uint64, raiseMaxIDErr, raiseSaveRowsErr bool) *mockDB {
+// TODO: разрослось кол-во аргументов в конструкторе -> булевые raise*Err можно вынести в отдельные сеттеры, пользуясь ими в prepare тест-таблиц только где нужно
+func NewMockDatabase(dbname string, ids []uint64, raiseMaxIDErr, raiseLoadRowsErr, raiseSaveRowsErr bool) *mockDB {
 	db := &mockDB{
 		mu:               &sync.Mutex{},
 		name:             dbname,
 		data:             make(map[uint64]Row, len(ids)),
 		maxID:            uint64(0),
 		maxIDErr:         raiseMaxIDErr,
+		loadRowsErr:      raiseLoadRowsErr,
 		saveRowsErr:      raiseSaveRowsErr,
 		concurrencyCheck: make(chan struct{}),
 	}
@@ -118,6 +121,11 @@ func (db *mockDB) LoadRows(ctx context.Context, minID, maxID uint64) ([]Row, err
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	if db.loadRowsErr {
+		db.loadRowsErr = false // убираем ошибку после предполагаемого ретрая для последующих вызовов
+		return nil, ErrDBTemporal
+	}
+
 	rows := []Row{}
 
 	for id := minID; id < maxID; id++ {
@@ -139,6 +147,14 @@ func (db *mockDB) LoadRows(ctx context.Context, minID, maxID uint64) ([]Row, err
 }
 
 func (db *mockDB) SaveRows(ctx context.Context, rows []Row) error {
+	if db.saveRowsErr {
+		db.mu.Lock()
+		db.saveRowsErr = false // убираем ошибку после предполагаемого ретрая для последующих вызовов
+		db.mu.Unlock()
+
+		return ErrDBTemporal
+	}
+
 	// подсчитываем максимум SaveRows в моменте для теста многопоточки
 	// через атомики и CAS-loop, иначе если навешать на всё тело ф-ии Lock/defer Unlock,
 	// то словим Lock-contention и, несмотря на распараллеливание в решении, тут в моке

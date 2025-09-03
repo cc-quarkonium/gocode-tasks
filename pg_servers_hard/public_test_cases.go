@@ -27,8 +27,8 @@ var testCases = []TestCase{
 				prodIds[i] = uint64(i + 1)
 			}
 
-			NewMockDatabase("PROD", prodIds, false, false)
-			NewMockDatabase("STATS", []uint64{}, false, false)
+			NewMockDatabase("PROD", prodIds, false, false, false)
+			NewMockDatabase("STATS", []uint64{}, false, false, false)
 			return struct{}{}
 		},
 		check: func(full bool) bool {
@@ -63,8 +63,8 @@ var testCases = []TestCase{
 				prodIds[i] = uint64(i + 1)
 			}
 
-			NewMockDatabase("PROD", prodIds, false, false)
-			NewMockDatabase("STATS", []uint64{1, 2}, false, false)
+			NewMockDatabase("PROD", prodIds, false, false, false)
+			NewMockDatabase("STATS", []uint64{1, 2}, false, false, false)
 			return struct{}{}
 		},
 		check: func(full bool) bool {
@@ -92,8 +92,8 @@ var testCases = []TestCase{
 		name: "Не переносим данные, если база PROD пустая",
 		full: true,
 		prepare: func() struct{} {
-			NewMockDatabase("PROD", []uint64{}, false, false)
-			NewMockDatabase("STATS", []uint64{}, false, false)
+			NewMockDatabase("PROD", []uint64{}, false, false, false)
+			NewMockDatabase("STATS", []uint64{}, false, false, false)
 			return struct{}{}
 		},
 		check: func(full bool) bool {
@@ -124,8 +124,8 @@ var testCases = []TestCase{
 			// создадим "дырку" на последнем ID
 			prodIds[prodRowNum-1] = prodIds[prodRowNum-1] + 1
 
-			NewMockDatabase("PROD", prodIds, false, false)
-			NewMockDatabase("STATS", []uint64{1, 2}, false, false)
+			NewMockDatabase("PROD", prodIds, false, false, false)
+			NewMockDatabase("STATS", []uint64{1, 2}, false, false, false)
 			return struct{}{}
 		},
 		check: func(full bool) bool {
@@ -153,8 +153,8 @@ var testCases = []TestCase{
 		name: "Данные корректно переливаются при наличии больших разниц в значениях ID",
 		full: true,
 		prepare: func() struct{} {
-			NewMockDatabase("PROD", []uint64{1, 2, 4, 1_998_193, 102_123_453}, false, false)
-			NewMockDatabase("STATS", []uint64{}, false, false)
+			NewMockDatabase("PROD", []uint64{1, 2, 4, 1_998_193, 102_123_453}, false, false, false)
+			NewMockDatabase("STATS", []uint64{}, false, false, false)
 			return struct{}{}
 		},
 		check: func(full bool) bool {
@@ -182,8 +182,8 @@ var testCases = []TestCase{
 		name: "Ожидается корректная обертка ошибок",
 		full: false,
 		prepare: func() struct{} {
-			NewMockDatabase("PROD", []uint64{1}, true, false)
-			NewMockDatabase("STATS", []uint64{}, false, false)
+			NewMockDatabase("PROD", []uint64{1}, true, false, false)
+			NewMockDatabase("STATS", []uint64{}, false, false, false)
 
 			return struct{}{}
 		},
@@ -202,8 +202,8 @@ var testCases = []TestCase{
 				prodIds[i] = uint64(i + 1)
 			}
 
-			NewMockDatabase("PROD", prodIds, false, false)
-			NewMockDatabase("STATS", []uint64{}, false, false)
+			NewMockDatabase("PROD", prodIds, false, false, false)
+			NewMockDatabase("STATS", []uint64{}, false, false, false)
 			return struct{}{}
 		},
 		check: func(full bool) bool {
@@ -233,8 +233,8 @@ var testCases = []TestCase{
 				prodIds[j] = uint64(j + 100_000 + 1)
 			}
 
-			NewMockDatabase("PROD", prodIds, false, false)
-			NewMockDatabase("STATS", []uint64{}, false, false)
+			NewMockDatabase("PROD", prodIds, false, false, false)
+			NewMockDatabase("STATS", []uint64{}, false, false, false)
 			return struct{}{}
 		},
 		check: func(full bool) bool {
@@ -277,8 +277,8 @@ var testCases = []TestCase{
 				prodIds[i] = uint64(i + 1)
 			}
 
-			NewMockDatabase("PROD", prodIds, false, false)
-			NewMockDatabase("STATS", []uint64{}, false, false)
+			NewMockDatabase("PROD", prodIds, false, false, false)
+			NewMockDatabase("STATS", []uint64{}, false, false, false)
 			return struct{}{}
 		},
 		check: func(full bool) bool {
@@ -289,6 +289,76 @@ var testCases = []TestCase{
 			}
 
 			return dbs.Stats.GetParallel() > 1
+		},
+	},
+	{
+		name: "Ожидается повторный вызов LoadRows() при возникновении краткосрочной ошибки",
+		full: true,
+		prepare: func() struct{} {
+			const prodRowNum = 1_000
+			prodIds := make([]uint64, prodRowNum)
+			for i := range prodRowNum {
+				prodIds[i] = uint64(i + 1)
+			}
+
+			NewMockDatabase("PROD", prodIds, false, true, false)
+			NewMockDatabase("STATS", []uint64{}, false, false, false)
+			return struct{}{}
+		},
+		check: func(full bool) bool {
+			CopyTable("PROD", "STATS", full)
+			dbs, err := getMockDatabases()
+			if err != nil {
+				return false
+			}
+
+			ctx := context.Background()
+			prodMaxID, err := dbs.Prod.GetMaxID(ctx)
+			if err != nil {
+				return false
+			}
+
+			statsMaxID, err := dbs.Stats.GetMaxID(ctx)
+			if err != nil {
+				return false
+			}
+
+			return prodMaxID == statsMaxID && dbs.Prod.GetDataLen() == dbs.Stats.GetDataLen()
+		},
+	},
+	{
+		name: "Ожидается повторный вызов SaveRows() при возникновении краткосрочной ошибки",
+		full: true,
+		prepare: func() struct{} {
+			const prodRowNum = 1_000
+			prodIds := make([]uint64, prodRowNum)
+			for i := range prodRowNum {
+				prodIds[i] = uint64(i + 1)
+			}
+
+			NewMockDatabase("PROD", prodIds, false, false, false)
+			NewMockDatabase("STATS", []uint64{}, false, true, false)
+			return struct{}{}
+		},
+		check: func(full bool) bool {
+			CopyTable("PROD", "STATS", full)
+			dbs, err := getMockDatabases()
+			if err != nil {
+				return false
+			}
+
+			ctx := context.Background()
+			prodMaxID, err := dbs.Prod.GetMaxID(ctx)
+			if err != nil {
+				return false
+			}
+
+			statsMaxID, err := dbs.Stats.GetMaxID(ctx)
+			if err != nil {
+				return false
+			}
+
+			return prodMaxID == statsMaxID && dbs.Prod.GetDataLen() == dbs.Stats.GetDataLen()
 		},
 	},
 }

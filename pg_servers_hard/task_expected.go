@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"sync"
+	"math/rand"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type Row []interface{}
@@ -22,8 +26,12 @@ type Database interface {
 	SaveRows(ctx context.Context, rows []Row) error
 }
 
-// также внутри пакета дана функция подключения:
+// Также внутри пакета дана функция подключения:
 // func Connect(ctx context.Context, dbname string) (Database, error)
+
+// Подразумеваем, что в результатах методов Database и Connect
+// временные ошибки обернуты кастомной ошибкой ErrDBTemporal
+var ErrDBTemporal = errors.New("temporary db error")
 
 // CopyTable копирует таблицу profiles с одного сервера на другой.
 // Если full=false, то переливка продолжается с места прошлой ошибки.
@@ -32,7 +40,8 @@ func CopyTable(fromName string, toName string, full bool) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	prodDB, err := withRetry(ctx, 3, func() (Database, error) {
+	// подключение с ретраями
+	prodDB, err := withRetry(ctx, func() (Database, error) {
 		return Connect(ctx, fromName)
 	})
 	if err != nil {
@@ -40,7 +49,7 @@ func CopyTable(fromName string, toName string, full bool) error {
 	}
 	defer prodDB.Close()
 
-	statsDB, err := withRetry(ctx, 3, func() (Database, error) {
+	statsDB, err := withRetry(ctx, func() (Database, error) {
 		return Connect(ctx, toName)
 	})
 	if err != nil {
@@ -52,7 +61,7 @@ func CopyTable(fromName string, toName string, full bool) error {
 	if full {
 		startID = 0
 	} else {
-		startID, err = withRetry(ctx, 3, func() (uint64, error) {
+		startID, err = withRetry(ctx, func() (uint64, error) {
 			return statsDB.GetMaxID(ctx)
 		})
 		if err != nil {
@@ -60,7 +69,7 @@ func CopyTable(fromName string, toName string, full bool) error {
 		}
 	}
 
-	endID, err := withRetry(ctx, 3, func() (uint64, error) {
+	endID, err := withRetry(ctx, func() (uint64, error) {
 		return prodDB.GetMaxID(ctx)
 	})
 	if err != nil {
@@ -70,99 +79,105 @@ func CopyTable(fromName string, toName string, full bool) error {
 	const batchSize = 10_000
 	const workers = 10
 
-	jobs := make(chan []Row, workers)
-	errCh := make(chan error, 1)
+	rowsCh := make(chan []Row, workers)
 
-	var wg sync.WaitGroup
-	wg.Add(workers)
+	g, gctx := errgroup.WithContext(ctx)
 
-	// запуск воркеров
-	for range workers {
-		go func() {
-			defer wg.Done()
-			for rows := range jobs {
-				if e := withRetryVoid(ctx, 3, func() error {
-					return statsDB.SaveRows(ctx, rows)
-				}); e != nil {
-					select {
-					case errCh <- e:
-					default:
-					}
-					cancel()
-					return
+	// Горутина собирает батчи из PROD
+	g.Go(func() error {
+		defer close(rowsCh)
+
+		curID := startID
+		for curID < endID {
+			batchRows := make([]Row, 0, batchSize)
+
+			for len(batchRows) < batchSize && curID < endID {
+				nextID := curID + uint64(batchSize-len(batchRows))
+
+				rows, err := withRetry(gctx, func() ([]Row, error) {
+					return prodDB.LoadRows(gctx, curID, nextID)
+				})
+				if err != nil {
+					return fmt.Errorf("load rows: %w", err)
+				}
+
+				batchRows = append(batchRows, rows...)
+				curID = nextID
+			}
+
+			if len(batchRows) > 0 {
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				case rowsCh <- batchRows:
 				}
 			}
-		}()
-	}
-
-	// формируем батчи
-	curID := startID
-	for curID < endID {
-		select {
-		case <-ctx.Done():
-			close(jobs)
-			wg.Wait()
-			return <-errCh
-		default:
 		}
-
-		batchRows := make([]Row, 0, batchSize)
-
-		for len(batchRows) < batchSize && curID < endID {
-			nextID := curID + uint64(batchSize-len(batchRows))
-			rows, e := withRetry(ctx, 3, func() ([]Row, error) {
-				return prodDB.LoadRows(ctx, curID, nextID)
-			})
-			if e != nil {
-				close(jobs)
-				wg.Wait()
-				return fmt.Errorf("load rows: %w", e)
-			}
-
-			if len(rows) == 0 {
-				curID = nextID
-				continue
-			}
-			batchRows = append(batchRows, rows...)
-			curID = nextID
-		}
-
-		jobs <- batchRows
-	}
-
-	close(jobs)
-	wg.Wait()
-
-	select {
-	case e := <-errCh:
-		return fmt.Errorf("copy failed: %w", e)
-	default:
 		return nil
-	}
-}
-
-// retry-хелперы
-func withRetry[T any](ctx context.Context, attempts int, fn func() (T, error)) (T, error) {
-	var zero T
-	var err error
-	for i := 0; i < attempts; i++ {
-		var v T
-		v, err = fn()
-		if err == nil {
-			return v, nil
-		}
-		select {
-		case <-ctx.Done():
-			return zero, ctx.Err()
-		default:
-		}
-	}
-	return zero, err
-}
-
-func withRetryVoid(ctx context.Context, attempts int, fn func() error) error {
-	_, err := withRetry(ctx, attempts, func() (struct{}, error) {
-		return struct{}{}, fn()
 	})
-	return err
+
+	// Воркеры сохраняют данные
+	for range workers {
+		g.Go(func() error {
+			for {
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				case rows, ok := <-rowsCh:
+					if !ok {
+						return nil
+					}
+					_, err := withRetry(gctx, func() ([]Row, error) {
+						return nil, statsDB.SaveRows(gctx, rows)
+					})
+					if err != nil {
+						return fmt.Errorf("save rows: %w", err)
+					}
+				}
+			}
+		})
+	}
+
+	// ждём завершения
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("copy failed: %w", err)
+	}
+	return nil
+}
+
+// пропишем константы тут; вслух можно сказать, что по-хорошему храним это где-нибудь в конфиге
+const maxRetries = 3
+const backoffBaseForRetries = time.Millisecond * 100
+
+// ф-я обертка операций с ретраями при временных ошибках
+func withRetry[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+	var result T
+	backoff := backoffBaseForRetries // на основе базовой константы заводим переменную, которая будет расти с кол-вом попыток
+
+	// + 1 т.к. первая попытка это не повтор
+	for range maxRetries + 1 {
+		val, err := fn()
+		if err == nil {
+			return val, nil
+		}
+		// если ошибка не является постоянной, то есть смысл повторить
+		if errors.Is(err, ErrDBTemporal) {
+			// добавляем джиттер
+			jitter := time.Duration(rand.Int63n(int64(backoff)))
+			sleep := backoff + jitter
+
+			// помним, что у нас есть context и если он отменем, то нет смысла в след. попытках
+			select {
+			case <-ctx.Done():
+				return result, ctx.Err()
+			case <-time.After(sleep):
+			}
+
+			backoff *= 2
+			continue
+		}
+		return result, err
+	}
+
+	return result, fmt.Errorf("too many retries: %w", ErrDBTemporal)
 }
