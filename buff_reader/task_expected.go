@@ -6,9 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync/atomic"
-
-	"slices"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -77,8 +74,8 @@ func Pipe(config *Config, producer Producer, consumer Consumer) error {
 
 func runNext(ctx context.Context, p Producer, maxItems int, batchCh chan<- batch) error {
 	defer close(batchCh)
-	// seqCounter - атомарный счётчик порядковых номеров вызовов Next
-	var seqCounter int64
+	// seqCounter - счётчик порядковых номеров вызовов Next
+	seqCounter := 0
 	// локальный буфер для накопления элементов в batch
 	buf := make([]any, 0, maxItems)
 	// список cookie, соответствующих элементам в buf
@@ -88,13 +85,13 @@ func runNext(ctx context.Context, p Producer, maxItems int, batchCh chan<- batch
 		items, cookie, err := p.Next()
 		if errors.Is(err, ErrEofCommitCookie) {
 			if len(buf) > 0 {
-				// копируем buf и cookies, чтобы избежать гонок
+				seqCounter += 1
 				err := writeChanWithContext(ctx,
 					batchCh,
 					batch{
-						seq:     int(atomic.AddInt64(&seqCounter, 1) - 1),
-						items:   slices.Clone(buf),
-						cookies: slices.Clone(cookies),
+						seq:     seqCounter,
+						items:   buf,
+						cookies: cookies,
 					},
 				)
 				if err != nil {
@@ -109,12 +106,13 @@ func runNext(ctx context.Context, p Producer, maxItems int, batchCh chan<- batch
 
 		// если items не помещаются в buf -> сбрасываем его как batch
 		if len(buf)+len(items) > maxItems {
+			seqCounter += 1
 			err := writeChanWithContext(ctx,
 				batchCh,
 				batch{
-					seq:     int(atomic.AddInt64(&seqCounter, 1) - 1),
-					items:   slices.Clone(buf),
-					cookies: slices.Clone(cookies),
+					seq:     seqCounter,
+					items:   buf,
+					cookies: cookies,
 				},
 			)
 			if err != nil {
@@ -162,7 +160,7 @@ func runProcess(ctx context.Context, config *Config, c Consumer, batchCh <-chan 
 
 func runCommit(ctx context.Context, p Producer, procCh <-chan batch) error {
 	// nextSeq - ожидаемый номер следующего батча для коммита
-	nextSeq := 0
+	nextSeq := 1
 	// buffer - хранит батчи, которые пришли раньше времени
 	buffer := make(map[int]batch)
 
