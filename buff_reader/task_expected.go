@@ -13,7 +13,16 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+/*
+Предопределенные константы вынесены в отдельную структуру конфига
+type Config struct {
+	maxItems       uint16
+	processWorkers uint8
+}
+*/
+
 var (
+	ErrEofCommitCookie   = errors.New("no more data")
 	ErrNextFailed        = errors.New("next failed")
 	ErrProcessFailed     = errors.New("process failed")
 	ErrCommitFailed      = errors.New("commit failed")
@@ -36,17 +45,11 @@ type batch struct {
 	cookies []int // список cookie, которые нужно подтвердить после Commit
 }
 
-const (
-	nextWorkers     = 5
-	processWorkers  = 8
-	eofCommitCookie = -1 // сигнализирует об отсутствии данных, нужно для тестов
-)
-
 // основная идея - распознать, что задача решается Pipeline-паттерном
 // но есть два усложнения:
 // для Process нужно накапливать batch
 // Commit() нужно вызывать в последовательности получения Cookie из Next()
-func Pipe(p Producer, c Consumer, maxItems int) error {
+func Pipe(config *Config, producer Producer, consumer Consumer) error {
 	gr, ctx := errgroup.WithContext(context.Background())
 
 	// для тестовых запусков хорошо бы проверить как себя ведет программа с небуф. каналами
@@ -58,97 +61,88 @@ func Pipe(p Producer, c Consumer, maxItems int) error {
 	procCh := make(chan batch)
 
 	gr.Go(func() error {
-		return runNext(ctx, p, maxItems, batchCh)
+		return runNext(ctx, producer, int(config.maxItems), batchCh)
 	})
 
 	gr.Go(func() error {
-		return runProcess(ctx, c, batchCh, procCh)
+		return runProcess(ctx, config, consumer, batchCh, procCh)
 	})
 
 	gr.Go(func() error {
-		return runCommit(ctx, p, procCh)
+		return runCommit(ctx, producer, procCh)
 	})
 
 	return gr.Wait()
 }
 
-func runNext(ctx context.Context, p Producer, maxItems int, out chan<- batch) error {
-	defer close(out)
-
+func runNext(ctx context.Context, p Producer, maxItems int, batchCh chan<- batch) error {
+	defer close(batchCh)
 	// seqCounter - атомарный счётчик порядковых номеров вызовов Next
 	var seqCounter int64
-	gr, ctx := errgroup.WithContext(ctx)
+	// локальный буфер для накопления элементов в batch
+	buf := make([]any, 0, maxItems)
+	// список cookie, соответствующих элементам в buf
+	var cookies []int
 
-	for range nextWorkers {
-		gr.Go(func() error {
-			// локальный буфер для накопления элементов в batch
-			buf := make([]any, 0, maxItems)
-			// список cookie, соответствующих элементам в buf
-			var cookies []int
-
-			for {
-				items, cookie, err := p.Next()
+	for {
+		items, cookie, err := p.Next()
+		if errors.Is(err, ErrEofCommitCookie) {
+			if len(buf) > 0 {
+				// копируем buf и cookies, чтобы избежать гонок
+				err := writeChanWithContext(ctx,
+					batchCh,
+					batch{
+						seq:     int(atomic.AddInt64(&seqCounter, 1) - 1),
+						items:   slices.Clone(buf),
+						cookies: slices.Clone(cookies),
+					},
+				)
 				if err != nil {
-					return fmt.Errorf("%w: %v", ErrNextFailed, err)
+					return fmt.Errorf("write to batch channel: %w", err)
 				}
-				if cookie == eofCommitCookie {
-					if len(buf) > 0 {
-						seq := int(atomic.AddInt64(&seqCounter, 1) - 1)
-						// копируем buf и cookies, чтобы избежать гонок
-						err := writeChanWithContext(ctx,
-							out,
-							batch{
-								seq:     seq,
-								items:   slices.Clone(buf),
-								cookies: slices.Clone(cookies),
-							},
-						)
-						if err != nil {
-							return err
-						}
-					}
-					return nil
-				}
-
-				// если items не помещаются в buf -> сбрасываем его как batch
-				if len(buf)+len(items) > maxItems {
-					seq := int(atomic.AddInt64(&seqCounter, 1) - 1)
-					err := writeChanWithContext(ctx,
-						out,
-						batch{
-							seq:     seq,
-							items:   slices.Clone(buf),
-							cookies: slices.Clone(cookies),
-						},
-					)
-					if err != nil {
-						return err
-					}
-					// обнуляем буфер и список cookies
-					buf = make([]any, 0, maxItems)
-					cookies = []int{}
-				}
-				// добавляем новые элементы и cookie в текущий batch
-				buf = append(buf, items...)
-				cookies = append(cookies, cookie)
 			}
-		})
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrNextFailed, err)
+		}
+
+		// если items не помещаются в buf -> сбрасываем его как batch
+		if len(buf)+len(items) > maxItems {
+			err := writeChanWithContext(ctx,
+				batchCh,
+				batch{
+					seq:     int(atomic.AddInt64(&seqCounter, 1) - 1),
+					items:   slices.Clone(buf),
+					cookies: slices.Clone(cookies),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("write to batch channel: %w", err)
+			}
+			// обнуляем буфер и список cookies
+			buf = make([]any, 0, maxItems)
+			cookies = []int{}
+		}
+		// добавляем новые элементы и cookie в текущий batch
+		buf = append(buf, items...)
+		cookies = append(cookies, cookie)
 	}
 
-	return gr.Wait()
+	return nil
 }
 
-func runProcess(ctx context.Context, c Consumer, in <-chan batch, out chan<- batch) error {
-	defer close(out)
+func runProcess(ctx context.Context, config *Config, c Consumer, batchCh <-chan batch, procCh chan<- batch) error {
+	defer close(procCh)
 
 	gr, ctx := errgroup.WithContext(ctx)
 
-	for range nextWorkers {
+	for range config.processWorkers {
 		gr.Go(func() error {
 			for {
-				b, ok, err := readChanWithContext(ctx, in)
+				b, ok, err := readChanWithContext(ctx, batchCh)
 				if err != nil {
-					return err
+					return fmt.Errorf("read from batch channel: %w", err)
 				}
 				if !ok {
 					return nil
@@ -156,8 +150,8 @@ func runProcess(ctx context.Context, c Consumer, in <-chan batch, out chan<- bat
 				if err := c.Process(b.items); err != nil {
 					return fmt.Errorf("%w: %v", ErrProcessFailed, err)
 				}
-				if err := writeChanWithContext(ctx, out, b); err != nil {
-					return err
+				if err := writeChanWithContext(ctx, procCh, b); err != nil {
+					return fmt.Errorf("write to commit channel: %w", err)
 				}
 			}
 		})
@@ -166,16 +160,16 @@ func runProcess(ctx context.Context, c Consumer, in <-chan batch, out chan<- bat
 	return gr.Wait()
 }
 
-func runCommit(ctx context.Context, p Producer, in <-chan batch) error {
+func runCommit(ctx context.Context, p Producer, procCh <-chan batch) error {
 	// nextSeq - ожидаемый номер следующего батча для коммита
 	nextSeq := 0
 	// buffer - хранит батчи, которые пришли раньше времени
 	buffer := make(map[int]batch)
 
 	for {
-		batch, ok, err := readChanWithContext(ctx, in)
+		batch, ok, err := readChanWithContext(ctx, procCh)
 		if err != nil {
-			return err
+			return fmt.Errorf("read from commit channel: %w", err)
 		}
 
 		if !ok { // канал закрыт

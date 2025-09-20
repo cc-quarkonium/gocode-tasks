@@ -4,6 +4,11 @@ import (
 	"sync/atomic"
 )
 
+type Config struct {
+	maxItems       uint16
+	processWorkers uint8
+}
+
 type mockProducer struct {
 	maxItems int   // сколько всего элементов в источнике
 	batch    int   // желаемый размер выдаваемой пачки
@@ -15,7 +20,7 @@ func (m *mockProducer) Next() ([]any, int, error) {
 		cur := int(atomic.LoadInt32(&m.counter))
 		if cur >= m.maxItems {
 			// конец данных
-			return nil, eofCommitCookie, nil
+			return nil, 0, ErrEofCommitCookie
 		}
 
 		remaining := m.maxItems - cur
